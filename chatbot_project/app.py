@@ -1,3 +1,5 @@
+import os
+
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -7,10 +9,21 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 
 
 # ==========================================
+# Project paths
+# ==========================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DATA_DIR = os.path.join(BASE_DIR, "data")
+VECTORSTORE_DIR = os.path.join(BASE_DIR, "vectorstore")
+ENV_FILE = os.path.join(BASE_DIR, ".env")
+
+
+# ==========================================
 # Load environment variables
 # ==========================================
 
-load_dotenv()
+load_dotenv(ENV_FILE)
 
 
 # ==========================================
@@ -58,7 +71,7 @@ embedding = load_embedding_model()
 def load_vector_database():
 
     return Chroma(
-        persist_directory="vectorstore",
+        persist_directory=VECTORSTORE_DIR,
         embedding_function=embedding
     )
 
@@ -86,7 +99,7 @@ retriever = db.as_retriever(
 def load_llm():
 
     return ChatGoogleGenerativeAI(
-        model="gemini-3.6-flash",
+        model="gemini-2.5-flash",
         temperature=0
     )
 
@@ -112,21 +125,13 @@ if question:
 
     with st.spinner("Searching documents..."):
 
-        # Retrieve relevant chunks
         docs = retriever.invoke(question)
 
-
-        # Create context
         context = "\n\n".join(
             f"Source: {doc.metadata.get('source', 'Unknown')}\n"
             f"{doc.page_content}"
             for doc in docs
         )
-
-
-        # ==========================================
-        # Prompt
-        # ==========================================
 
         prompt = f"""
 You are an assistant answering questions using ONLY the provided context.
@@ -148,17 +153,7 @@ Question:
 Answer:
 """
 
-
-        # ==========================================
-        # Ask Gemini
-        # ==========================================
-
         response = llm.invoke(prompt)
-
-
-        # ==========================================
-        # Extract clean response
-        # ==========================================
 
         if isinstance(response.content, list):
 
