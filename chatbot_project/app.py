@@ -1,5 +1,3 @@
-import os
-
 import streamlit as st
 from dotenv import load_dotenv
 
@@ -8,27 +6,16 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 
-# ==========================================
-# Project paths
-# ==========================================
+# ============================================================
+# LOAD ENVIRONMENT VARIABLES
+# ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-DATA_DIR = os.path.join(BASE_DIR, "data")
-VECTORSTORE_DIR = os.path.join(BASE_DIR, "vectorstore")
-ENV_FILE = os.path.join(BASE_DIR, ".env")
+load_dotenv()
 
 
-# ==========================================
-# Load environment variables
-# ==========================================
-
-load_dotenv(ENV_FILE)
-
-
-# ==========================================
-# Page configuration
-# ==========================================
+# ============================================================
+# STREAMLIT PAGE CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="Multi-PDF RAG Chatbot",
@@ -37,9 +24,9 @@ st.set_page_config(
 )
 
 
-# ==========================================
-# Title
-# ==========================================
+# ============================================================
+# TITLE
+# ============================================================
 
 st.title("📚 Multi-PDF RAG Chatbot")
 
@@ -48,9 +35,9 @@ st.write(
 )
 
 
-# ==========================================
-# Load embedding model
-# ==========================================
+# ============================================================
+# LOAD EMBEDDING MODEL
+# ============================================================
 
 @st.cache_resource
 def load_embedding_model():
@@ -63,15 +50,15 @@ def load_embedding_model():
 embedding = load_embedding_model()
 
 
-# ==========================================
-# Load ChromaDB
-# ==========================================
+# ============================================================
+# LOAD CHROMA VECTOR DATABASE
+# ============================================================
 
 @st.cache_resource
 def load_vector_database():
 
     return Chroma(
-        persist_directory=VECTORSTORE_DIR,
+        persist_directory="vectorstore",
         embedding_function=embedding
     )
 
@@ -79,9 +66,9 @@ def load_vector_database():
 db = load_vector_database()
 
 
-# ==========================================
-# Create retriever
-# ==========================================
+# ============================================================
+# CREATE RETRIEVER
+# ============================================================
 
 retriever = db.as_retriever(
     search_type="similarity",
@@ -91,9 +78,9 @@ retriever = db.as_retriever(
 )
 
 
-# ==========================================
-# Load Gemini
-# ==========================================
+# ============================================================
+# LOAD GEMINI
+# ============================================================
 
 @st.cache_resource
 def load_llm():
@@ -107,9 +94,9 @@ def load_llm():
 llm = load_llm()
 
 
-# ==========================================
-# Question input
-# ==========================================
+# ============================================================
+# USER QUESTION
+# ============================================================
 
 question = st.text_input(
     "Ask a question:",
@@ -117,21 +104,35 @@ question = st.text_input(
 )
 
 
-# ==========================================
-# Generate answer
-# ==========================================
+# ============================================================
+# RAG PIPELINE
+# ============================================================
 
 if question:
 
     with st.spinner("Searching documents..."):
 
+        # ----------------------------------------------------
+        # STEP 1: RETRIEVE RELEVANT DOCUMENT CHUNKS
+        # ----------------------------------------------------
+
         docs = retriever.invoke(question)
+
+
+        # ----------------------------------------------------
+        # STEP 2: CREATE CONTEXT
+        # ----------------------------------------------------
 
         context = "\n\n".join(
             f"Source: {doc.metadata.get('source', 'Unknown')}\n"
             f"{doc.page_content}"
             for doc in docs
         )
+
+
+        # ----------------------------------------------------
+        # STEP 3: CREATE PROMPT
+        # ----------------------------------------------------
 
         prompt = f"""
 You are an assistant answering questions using ONLY the provided context.
@@ -153,7 +154,42 @@ Question:
 Answer:
 """
 
-        response = llm.invoke(prompt)
+
+        # ----------------------------------------------------
+        # STEP 4: ASK GEMINI
+        # ----------------------------------------------------
+
+        try:
+
+            response = llm.invoke(prompt)
+
+        except Exception as e:
+
+            error_message = str(e)
+
+            # Handle Gemini rate-limit / quota errors
+            if "429" in error_message or "rate" in error_message.lower():
+
+                st.error(
+                    "⚠️ Gemini API daily limit reached. "
+                    "Please try again after the quota resets."
+                )
+
+                st.stop()
+
+            # Handle other API errors
+            else:
+
+                st.error(
+                    "❌ Something went wrong while generating the answer."
+                )
+
+                st.stop()
+
+
+        # ----------------------------------------------------
+        # STEP 5: EXTRACT ANSWER
+        # ----------------------------------------------------
 
         if isinstance(response.content, list):
 
@@ -161,7 +197,10 @@ Answer:
 
             for item in response.content:
 
-                if isinstance(item, dict) and item.get("type") == "text":
+                if (
+                    isinstance(item, dict)
+                    and item.get("type") == "text"
+                ):
 
                     answer += item.get("text", "")
 
@@ -170,18 +209,18 @@ Answer:
             answer = response.content
 
 
-    # ==========================================
-    # Display answer
-    # ==========================================
+    # ========================================================
+    # DISPLAY ANSWER
+    # ========================================================
 
     st.subheader("🤖 Answer")
 
     st.write(answer)
 
 
-    # ==========================================
-    # Display sources
-    # ==========================================
+    # ========================================================
+    # DISPLAY SOURCES
+    # ========================================================
 
     st.subheader("📄 Sources")
 
@@ -189,7 +228,10 @@ Answer:
 
     for doc in docs:
 
-        source = doc.metadata.get("source", "Unknown")
+        source = doc.metadata.get(
+            "source",
+            "Unknown"
+        )
 
         sources.add(source)
 
