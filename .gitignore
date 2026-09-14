@@ -1,7 +1,7 @@
 venv/
 .env
 
-vectorstore/
+# vectorstore/
 
 __pycache__/
 *.pyc
