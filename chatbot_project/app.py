@@ -1,241 +1,397 @@
+import os
+import re
 import streamlit as st
-from dotenv import load_dotenv
+from pathlib import Path
+from PyPDF2 import PdfReader
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from google import genai
+from google.genai import types
 
-from langchain_chroma import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-
-# ============================================================
-# LOAD ENVIRONMENT VARIABLES
-# ============================================================
-
-load_dotenv()
-
-
-# ============================================================
-# STREAMLIT PAGE CONFIGURATION
-# ============================================================
+# =========================
+# CONFIG
+# =========================
 
 st.set_page_config(
     page_title="Multi-PDF RAG Chatbot",
     page_icon="📚",
-    layout="centered"
+    layout="wide"
 )
 
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
 
-# ============================================================
-# TITLE
-# ============================================================
+# =========================
+# GEMINI
+# =========================
+
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not API_KEY:
+    try:
+        API_KEY = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        API_KEY = None
+
+if API_KEY:
+    client = genai.Client(api_key=API_KEY)
+else:
+    client = None
+
+
+# =========================
+# PAGE TITLE
+# =========================
 
 st.title("📚 Multi-PDF RAG Chatbot")
-
-st.write(
-    "Ask questions about the information contained in the documents."
-)
+st.write("Ask questions about the information contained in the documents.")
 
 
-# ============================================================
-# LOAD EMBEDDING MODEL
-# ============================================================
+# =========================
+# PDF PROCESSING
+# =========================
 
-@st.cache_resource
-def load_embedding_model():
+def extract_pdf_text(file_path):
 
-    return HuggingFaceEmbeddings(
-        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    reader = PdfReader(file_path)
+
+    pages = []
+
+    for page_number, page in enumerate(reader.pages, start=1):
+
+        try:
+            text = page.extract_text()
+        except Exception:
+            text = ""
+
+        if text:
+            text = text.strip()
+
+            if text:
+                pages.append({
+                    "text": text,
+                    "source": file_path.name,
+                    "page": page_number
+                })
+
+    return pages
+
+
+def split_text(text, chunk_size=1000, overlap=200):
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if len(text) <= chunk_size:
+        return [text]
+
+    chunks = []
+
+    start = 0
+
+    while start < len(text):
+
+        end = start + chunk_size
+
+        chunk = text[start:end]
+
+        chunks.append(chunk.strip())
+
+        start += chunk_size - overlap
+
+    return chunks
+
+
+def build_documents():
+
+    documents = []
+
+    pdf_files = list(DATA_DIR.glob("*.pdf"))
+
+    for pdf_file in pdf_files:
+
+        pages = extract_pdf_text(pdf_file)
+
+        for page_data in pages:
+
+            chunks = split_text(page_data["text"])
+
+            for chunk in chunks:
+
+                if len(chunk.strip()) > 20:
+
+                    documents.append({
+                        "text": chunk,
+                        "source": page_data["source"],
+                        "page": page_data["page"]
+                    })
+
+    return documents
+
+
+# =========================
+# LOAD DOCUMENTS
+# =========================
+
+@st.cache_data
+def load_documents():
+
+    return build_documents()
+
+
+documents = load_documents()
+
+
+# =========================
+# PDF UPLOAD
+# =========================
+
+with st.sidebar:
+
+    st.header("📄 Documents")
+
+    uploaded_files = st.file_uploader(
+        "Upload PDF files",
+        type=["pdf"],
+        accept_multiple_files=True
     )
 
+    if uploaded_files:
 
-embedding = load_embedding_model()
+        changed = False
+
+        for uploaded_file in uploaded_files:
+
+            file_path = DATA_DIR / uploaded_file.name
+
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            changed = True
+
+        if changed:
+            load_documents.clear()
+            st.rerun()
+
+    st.divider()
+
+    st.write(f"**PDF files:** {len(list(DATA_DIR.glob('*.pdf')))}")
+    st.write(f"**Text chunks:** {len(documents)}")
+
+    if st.button("🔄 Reload PDFs"):
+
+        load_documents.clear()
+        st.rerun()
 
 
-# ============================================================
-# LOAD CHROMA VECTOR DATABASE
-# ============================================================
+# =========================
+# CHECK DOCUMENTS
+# =========================
 
-@st.cache_resource
-def load_vector_database():
+if not documents:
 
-    return Chroma(
-        persist_directory="vectorstore",
-        embedding_function=embedding
+    st.warning(
+        "No readable PDF documents found. "
+        "Upload one or more PDFs from the sidebar."
     )
 
-
-db = load_vector_database()
-
-
-# ============================================================
-# CREATE RETRIEVER
-# ============================================================
-
-retriever = db.as_retriever(
-    search_type="similarity",
-    search_kwargs={
-        "k": 4
-    }
-)
+    st.stop()
 
 
-# ============================================================
-# LOAD GEMINI
-# ============================================================
+# =========================
+# CREATE TF-IDF INDEX
+# =========================
 
 @st.cache_resource
-def load_llm():
+def create_index(texts):
 
-    return ChatGoogleGenerativeAI(
-        model="gemini-3.6-flash",
-        temperature=0
+    vectorizer = TfidfVectorizer(
+        lowercase=True,
+        stop_words="english",
+        ngram_range=(1, 2)
     )
 
+    matrix = vectorizer.fit_transform(texts)
 
-llm = load_llm()
+    return vectorizer, matrix
 
 
-# ============================================================
-# USER QUESTION
-# ============================================================
+texts = [doc["text"] for doc in documents]
+
+vectorizer, document_matrix = create_index(texts)
+
+
+# =========================
+# RETRIEVAL
+# =========================
+
+def retrieve_documents(question, top_k=5):
+
+    question_vector = vectorizer.transform([question])
+
+    scores = cosine_similarity(
+        question_vector,
+        document_matrix
+    )[0]
+
+    ranked_indexes = scores.argsort()[::-1]
+
+    results = []
+
+    for index in ranked_indexes[:top_k]:
+
+        score = float(scores[index])
+
+        if score > 0:
+
+            doc = documents[index].copy()
+
+            doc["score"] = score
+
+            results.append(doc)
+
+    return results
+
+
+# =========================
+# GEMINI ANSWER
+# =========================
+
+def generate_answer(question, retrieved_docs):
+
+    if not retrieved_docs:
+
+        return (
+            "I couldn't find relevant information in the provided documents."
+        )
+
+    context_parts = []
+
+    for i, doc in enumerate(retrieved_docs, start=1):
+
+        context_parts.append(
+            f"""
+SOURCE {i}
+File: {doc['source']}
+Page: {doc['page']}
+
+Content:
+{doc['text']}
+"""
+        )
+
+    context = "\n".join(context_parts)
+
+    prompt = f"""
+You are a helpful document question-answering assistant.
+
+Answer the user's question ONLY using the information contained
+in the provided document context.
+
+If the answer is not present in the context, say:
+"I couldn't find that information in the provided documents."
+
+Do not make up information.
+
+When possible, give a clear and concise answer.
+
+DOCUMENT CONTEXT:
+{context}
+
+USER QUESTION:
+{question}
+
+ANSWER:
+"""
+
+    if client is None:
+
+        return (
+            "Gemini API key is not configured. "
+            "Set GEMINI_API_KEY and try again."
+        )
+
+    try:
+
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+
+        return response.text
+
+    except Exception as e:
+
+        return f"Gemini error: {str(e)}"
+
+
+# =========================
+# QUESTION
+# =========================
 
 question = st.text_input(
     "Ask a question:",
-    placeholder="Example: What is Papa's Spectacles?"
+    placeholder="What is Papa's Spectacles?"
 )
 
 
-# ============================================================
-# RAG PIPELINE
-# ============================================================
+# =========================
+# ANSWER
+# =========================
 
 if question:
 
-    with st.spinner("Searching documents..."):
+    with st.spinner("Searching the documents..."):
 
-        # ----------------------------------------------------
-        # STEP 1: RETRIEVE RELEVANT DOCUMENT CHUNKS
-        # ----------------------------------------------------
-
-        docs = retriever.invoke(question)
-
-
-        # ----------------------------------------------------
-        # STEP 2: CREATE CONTEXT
-        # ----------------------------------------------------
-
-        context = "\n\n".join(
-            f"Source: {doc.metadata.get('source', 'Unknown')}\n"
-            f"{doc.page_content}"
-            for doc in docs
+        retrieved_docs = retrieve_documents(
+            question,
+            top_k=5
         )
-
-
-        # ----------------------------------------------------
-        # STEP 3: CREATE PROMPT
-        # ----------------------------------------------------
-
-        prompt = f"""
-You are an assistant answering questions using ONLY the provided context.
-
-Rules:
-- Answer only using information present in the context.
-- If the answer cannot be found in the context, say:
-  "I couldn't find that information in the provided documents."
-- Do not make up information.
-- Give a clear and concise answer.
-- Mention the source PDF when appropriate.
-
-Context:
-{context}
-
-Question:
-{question}
-
-Answer:
-"""
-
-
-        # ----------------------------------------------------
-        # STEP 4: ASK GEMINI
-        # ----------------------------------------------------
-
-        try:
-
-            response = llm.invoke(prompt)
-
-        except Exception as e:
-
-            error_message = str(e)
-
-            # Handle Gemini rate-limit / quota errors
-            if "429" in error_message or "rate" in error_message.lower():
-
-                st.error(
-                    "⚠️ Gemini API daily limit reached. "
-                    "Please try again after the quota resets."
-                )
-
-                st.stop()
-
-            # Handle other API errors
-            else:
-
-                st.error(
-                    "❌ Something went wrong while generating the answer."
-                )
-
-                st.stop()
-
-
-        # ----------------------------------------------------
-        # STEP 5: EXTRACT ANSWER
-        # ----------------------------------------------------
-
-        if isinstance(response.content, list):
-
-            answer = ""
-
-            for item in response.content:
-
-                if (
-                    isinstance(item, dict)
-                    and item.get("type") == "text"
-                ):
-
-                    answer += item.get("text", "")
-
-        else:
-
-            answer = response.content
-
-
-    # ========================================================
-    # DISPLAY ANSWER
-    # ========================================================
 
     st.subheader("🤖 Answer")
 
-    st.write(answer)
+    if not retrieved_docs:
 
-
-    # ========================================================
-    # DISPLAY SOURCES
-    # ========================================================
-
-    st.subheader("📄 Sources")
-
-    sources = set()
-
-    for doc in docs:
-
-        source = doc.metadata.get(
-            "source",
-            "Unknown"
+        st.error(
+            "I couldn't find relevant information in the provided documents."
         )
 
-        sources.add(source)
+    else:
+
+        with st.spinner("Generating answer..."):
+
+            answer = generate_answer(
+                question,
+                retrieved_docs
+            )
+
+        st.write(answer)
+
+        # =========================
+        # SOURCES
+        # =========================
+
+        st.subheader("📄 Sources")
+
+        for i, doc in enumerate(retrieved_docs, start=1):
+
+            with st.expander(
+                f"{i}. {doc['source']} — Page {doc['page']}"
+            ):
+
+                st.write(
+                    f"**Relevance score:** {doc['score']:.3f}"
+                )
+
+                st.write(doc["text"])
 
 
-    for source in sources:
+# =========================
+# FOOTER
+# =========================
 
-        st.write(f"- {source}")
+st.divider()
+
+st.caption(
+    f"📚 {len(list(DATA_DIR.glob('*.pdf')))} PDF(s) • "
+    f"🔎 {len(documents)} searchable chunks"
+)
